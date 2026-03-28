@@ -1,54 +1,70 @@
+import asyncio
 import httpx
-import re
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 
 app = FastAPI()
 
-SOURCE_SIMPLE = "https://pypi.tuna.tsinghua.edu.cn/simple"
+# Список элитных зеркальных баз (пути к самим файлам)
+MIRRORS = [
+    "https://files.pythonhosted.org/packages",       # Оригинал (Fastly/Google)
+    "https://pypi.tuna.tsinghua.edu.cn/packages",    # Китай (Золотой стандарт)
+    "https://mirrors.aliyun.com/pypi/packages",      # Alibaba
+    "https://mirror.yandex.ru/pypi/packages",        # Россия (Яндекс)
+    "https://repo.huaweicloud.com/repository/pypi/packages", # Huawei
+    "https://pypi.cloudflare.com/packages",          # Cloudflare
+]
 
-@app.get("/simple", response_class=HTMLResponse)
-@app.get("/simple/", response_class=HTMLResponse)
-async def get_full_index(request: Request):
-    """Отдает полный список всех пакетов PyPI"""
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # Запрашиваем главный индекс у TUNA
-        resp = await client.get(f"{SOURCE_SIMPLE}/", follow_redirects=True)
+async def find_fastest_mirror(path: str):
+    """Гонка за миллисекунды: опрашиваем мировые дата-центры одновременно."""
+    # Таймаут 1.0 сек, чтобы не заставлять пользователя ждать
+    async with httpx.AsyncClient(follow_redirects=True, timeout=1.0) as client:
+        tasks = [client.head(f"{mirror}/{path}") for mirror in MIRRORS]
         
-        # Чтобы ссылки внутри индекса (на конкретные пакеты) работали через нас,
-        # нам нужно убедиться, что они относительные. 
-        # TUNA обычно отдает их как <a href="package-name/">
-        return HTMLResponse(content=resp.text)
-
-@app.get("/simple/{package}/", response_class=HTMLResponse)
-@app.get("/simple/{package}", response_class=HTMLResponse)
-async def get_package_index(package: str, request: Request):
-    """Отдает список версий конкретного пакета"""
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        target_url = f"{SOURCE_SIMPLE}/{package}/"
-        resp = await client.get(target_url, follow_redirects=True)
+        # Ждем, пока кто-то один не скажет "Я здесь и я быстрый!"
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         
-        if resp.status_code != 200:
-            return HTMLResponse("Package not found", status_code=404)
+        for task in done:
+            try:
+                response = task.result()
+                if response.status_code == 200:
+                    # Убиваем остальные запросы, победителю — всё!
+                    for p in pending: p.cancel()
+                    return str(response.url)
+            except Exception:
+                continue
+        
+        # Если все промолчали (бывает на редких пакетах), идем на оригинал
+        return f"{MIRRORS[0]}/{path}"
 
-        # Главная магия: подменяем ссылки на файлы, чтобы они качались через Vercel
-        # Мы меняем https://pypi.tuna.tsinghua.edu.cn/packages на /packages нашего домена
-        base_url = str(request.base_url).rstrip('/')
-        content = resp.text.replace(
-            "https://pypi.tuna.tsinghua.edu.cn/packages", 
-            f"{base_url}/packages"
-        )
+@app.get("/")
+async def root():
+    return HTMLResponse("""
+        <body style='font-family: sans-serif; text-align: center; padding-top: 50px;'>
+            <h1>🌐 Smart PyPI Mirror is Live</h1>
+            <p>Race active between: <b>Yandex, Google, Alibaba, Huawei, Cloudflare</b></p>
+            <code>pip install package -i https://pypi-cdn.vercel.app/simple</code>
+        </body>
+    """)
+
+@app.get("/simple/{package}/")
+@app.get("/simple/{package}")
+async def proxy_simple(package: str):
+    """Подменяем ссылки в индексе на свои, чтобы перехватить скачивание."""
+    # Используем Яндекс для получения списка версий (он очень быстрый в РФ)
+    target_url = f"https://mirror.yandex.ru/pypi/simple/{package}/"
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(target_url)
+        # Массовая замена всех возможных путей на наш локальный /packages/
+        content = resp.text
+        for m in ["https://files.pythonhosted.org/packages", 
+                  "https://pypi.tuna.tsinghua.edu.cn/packages",
+                  "https://mirror.yandex.ru/pypi/packages"]:
+            content = content.replace(m, "/packages")
         return HTMLResponse(content=content)
 
 @app.get("/packages/{path:path}")
-async def stream_package_file(path: str):
-    """Проксирует скачивание самих .whl и .tar.gz файлов"""
-    file_url = f"https://pypi.tuna.tsinghua.edu.cn/packages/{path}"
-    
-    async def stream_file():
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            async with client.stream("GET", file_url) as r:
-                async for chunk in r.aiter_bytes(chunk_size=8192):
-                    yield chunk
-
-    return StreamingResponse(stream_file())
+async def proxy_packages(path: str):
+    """Главный чит: мгновенный редирект на лучшего из списка."""
+    fastest_url = await find_fastest_mirror(path)
+    return RedirectResponse(url=fastest_url, status_code=302)
