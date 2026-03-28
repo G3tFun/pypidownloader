@@ -1,44 +1,46 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 import httpx
-import re
 
 app = FastAPI()
 
-# Источник данных - самое популярное зеркало
-REMOTE_PYPI = "https://pypi.tuna.tsinghua.edu.cn/simple"
-# Источник самих файлов (wheels)
-REMOTE_FILES = "https://pypi.tuna.tsinghua.edu.cn/packages"
+# Зеркало-источник (TUNA)
+SOURCE_SIMPLE = "https://pypi.tuna.tsinghua.edu.cn/simple"
+SOURCE_PACKAGES = "https://pypi.tuna.tsinghua.edu.cn/packages"
 
-@app.get("/simple", response_class=HTMLResponse)
-@app.get("/simple/", response_class=HTMLResponse)
-async def list_packages():
+@app.get("/simple/{package}")
+@app.get("/simple/{package}/")
+async def proxy_simple(package: str, request: Request):
     async with httpx.AsyncClient() as client:
-        res = await client.get(f"{REMOTE_PYPI}/")
-        return res.text
-
-@app.get("/simple/{package}", response_class=HTMLResponse)
-async def get_package(package: str, request: Request):
-    async with httpx.AsyncClient() as client:
-        res = await client.get(f"{REMOTE_PYPI}/{package}/")
-        if res.status_code != 200:
-            return HTMLResponse("Package not found", status_code=404)
+        # 1. Запрашиваем страницу пакета у китайцев
+        target_url = f"{SOURCE_SIMPLE}/{package}/"
+        resp = await client.get(target_url, follow_redirects=True)
         
-        # Заменяем оригинальные ссылки на ссылки через наш Vercel
-        content = res.text
-        # Ищем ссылки на пакеты и перенаправляем их на наш эндпоинт /packages
-        content = content.replace("https://pypi.tuna.tsinghua.edu.cn/packages", f"{request.base_url}packages")
-        return content
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code)
+
+        # 2. Подменяем их ссылки на наши, чтобы pip качал через твой Vercel
+        # Мы меняем оригинальный домен на домен твоего сайта в Vercel
+        base_url = str(request.base_url).rstrip('/')
+        content = resp.text.replace(
+            "https://pypi.tuna.tsinghua.edu.cn/packages", 
+            f"{base_url}/packages"
+        )
+        return HTMLResponse(content=content)
 
 @app.get("/packages/{path:path}")
-async def get_file(path: str):
-    # Стримим файл напрямую, чтобы не упереться в лимиты памяти Vercel
-    file_url = f"{REMOTE_FILES}/{path}"
+async def proxy_packages(path: str):
+    # 3. Стримим сам файл (wheel/tar.gz) напрямую
+    file_url = f"{SOURCE_PACKAGES}/{path}"
     
     async def stream_file():
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream("GET", file_url) as r:
                 async for chunk in r.aiter_bytes():
                     yield chunk
 
     return StreamingResponse(stream_file())
+
+@app.get("/")
+async def root():
+    return {"status": "PyPI Mirror is running", "source": "Tsinghua TUNA"}
