@@ -2,15 +2,7 @@
   "version": 2,
   "rewrites": [
     {
-      "source": "/simple/(.*)",
-      "destination": "/api/index.py"
-    },
-    {
-      "source": "/packages/(.*)",
-      "destination": "/api/index.py"
-    },
-    {
-      "source": "/",
+      "source": "/(.*)",
       "destination": "/api/index.py"
     }
   ]
