@@ -6,39 +6,40 @@ from fastapi.responses import RedirectResponse, HTMLResponse
 
 app = FastAPI()
 
-# Список 5-ти гигантов для "гонки" за самим файлом (.whl, .tar.gz)
+# Зеркала для скачивания самих файлов (.whl, .tar.gz)
 MIRROR_FILES = [
     "https://mirror.yandex.ru/pypi/packages",
     "https://pypi.tuna.tsinghua.edu.cn/packages",
     "https://mirrors.aliyun.com/pypi/packages",
     "https://repo.huaweicloud.com/repository/pypi/packages",
-    "https://files.pythonhosted.org/packages"
+    "https://files.pythonhosted.org/packages" # Официальный хостинг участвует в гонке
 ]
 
-# Список доменов для замены в HTML (чтобы перехватить ссылки и отправить их в наш прокси)
+# Список доменов для замены в HTML на наш прокси
 DOMAINS_TO_REPLACE = [
-    r"https://files.pythonhosted.org/packages",
-    r"https://mirror.yandex.ru/pypi/packages",
-    r"https://pypi.tuna.tsinghua.edu.cn/packages",
-    r"https://mirrors.aliyun.com/pypi/packages",
-    r"https://repo.huaweicloud.com/repository/pypi/packages",
+    r"https://files\.pythonhosted\.org/packages",
+    r"https://mirror\.yandex\.ru/pypi/packages",
+    r"https://pypi\.tuna\.tsinghua\.edu\.cn/packages",
+    r"https://mirrors\.aliyun\.com/pypi/packages",
+    r"https://repo\.huaweicloud\.com/repository/pypi/packages",
     r"https://[a-zA-Z0-9.-]+/pypi/packages",
     r"https://[a-zA-Z0-9.-]+/packages"
 ]
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>🌐 Smart PyPI Proxy is Live!</h1><p>Use: <code>-i https://pypi-cdn.vercel.app/simple</code></p>")
+    return HTMLResponse("<h1>🌐 Smart PyPI Proxy is Live</h1><p>Use: <code>pip install &lt;package&gt; -i https://pypi-cdn.vercel.app/simple</code></p>")
 
 @app.api_route("/simple/{package}/{rest:path}", methods=["GET", "HEAD"])
 @app.api_route("/simple/{package}", methods=["GET", "HEAD"])
 async def proxy_simple(package: str, rest: str = ""):
-    """
-    Получает список версий с официального PyPI (там есть всё, даже старье).
-    Затем подменяет ссылки на наш прокси /packages/...
-    """
-    headers = {"User-Agent": "pip/24.0"}
-    # Используем pypi.org как эталон списка версий
+    """Берем ПОЛНЫЙ список версий с официального PyPI, но ссылки подменяем на наши."""
+    headers = {
+        "User-Agent": "pip/24.0",
+        "Accept": "text/html"
+    }
+    
+    # Идем на оригинал, чтобы найти абсолютно все версии, включая старые (например, torch==1.0.0)
     target_url = f"https://pypi.org/simple/{package}/"
     
     async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
@@ -48,42 +49,43 @@ async def proxy_simple(package: str, rest: str = ""):
             if resp.status_code == 200:
                 content = resp.text
                 
-                # 1. Сначала чистим относительные пути, если они есть
+                # 1. Заменяем относительные пути (PyPI часто использует ../../packages)
                 content = content.replace("../../packages", "/packages")
                 content = content.replace("../packages", "/packages")
                 
-                # 2. Перехватываем все ссылки на хранилища файлов и меняем на наш /packages
+                # 2. Заменяем все абсолютные ссылки на файлы на наш локальный /packages/
                 for domain in DOMAINS_TO_REPLACE:
                     content = re.sub(domain, "/packages", content)
                 
                 return HTMLResponse(content=content)
             
-            return HTMLResponse(f"Package {package} not found on PyPI", status_code=404)
+            return HTMLResponse(f"Package {package} not found on official PyPI", status_code=404)
         except Exception as e:
             return HTMLResponse(f"Error fetching simple index: {str(e)}", status_code=500)
 
 async def find_fastest_mirror(path: str):
-    """Опрашивает зеркала и выбирает самое быстрое для скачивания файла."""
+    """Гонка за файлом: кто быстрее отдаст 200 OK."""
     async with httpx.AsyncClient(timeout=3.0, follow_redirects=True) as client:
         tasks = [client.head(f"{mirror}/{path}") for mirror in MIRROR_FILES]
         
         try:
-            # Возвращаем первое зеркало, которое ответило 200 OK
             for completed_task in asyncio.as_completed(tasks, timeout=3.5):
                 try:
                     res = await completed_task
+                    # Отдаем ссылку только если зеркало реально имеет этот файл (200 OK)
                     if res.status_code == 200:
                         return str(res.url)
                 except Exception:
                     continue 
         except Exception:
-            pass
+            pass # Игнорируем общий таймаут гонки
 
-    # Если никто не ответил вовремя, используем Яндекс по умолчанию
-    return f"{MIRROR_FILES[0]}/{path}"
+    # План Б: Если все зеркала молчат (или удалили старую версию для экономии места),
+    # жестко отдаем с официального pythonhosted, там файл есть на 100%
+    return f"https://files.pythonhosted.org/packages/{path}"
 
 @app.api_route("/packages/{path:path}", methods=["GET", "HEAD"])
 async def proxy_packages(path: str):
-    """Точка входа для скачивания файлов: запускает гонку и делает редирект."""
+    """Перехватываем запрос на файл и редиректим на лучшее зеркало."""
     fastest_url = await find_fastest_mirror(path)
     return RedirectResponse(url=fastest_url, status_code=302)
