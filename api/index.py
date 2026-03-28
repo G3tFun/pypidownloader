@@ -63,24 +63,24 @@ async def proxy_simple(package: str, rest: str = ""):
             return HTMLResponse(f"Error: {str(e)}", status_code=500)
 
 async def find_fastest_mirror(path: str):
-    """Та самая 'гонка' зеркал за 0.1-0.5 сек."""
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        # HEAD запросы ко всем 5 зеркалам одновременно
+    """Безопасная гонка зеркал."""
+    async with httpx.AsyncClient(timeout=3.0, follow_redirects=True) as client:
+        # Формируем список задач
         tasks = [client.head(f"{mirror}/{path}") for mirror in MIRROR_FILES]
         
-        # Ждем первого, кто вернет 200 OK
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        
-        for task in done:
-            try:
-                res = task.result()
-                if res.status_code == 200:
-                    for p in pending: p.cancel() # Останавливаем остальных
-                    return str(res.url)
-            except:
-                continue
-    
-    # Если все упали или долго думали — отдаем Яндекс по умолчанию
+        try:
+            # Ждем завершения первой успешной задачи
+            for completed_task in asyncio.as_completed(tasks, timeout=3.5):
+                try:
+                    res = await completed_task
+                    if res.status_code == 200:
+                        return str(res.url)
+                except Exception:
+                    continue # Игнорируем ошибки конкретного зеркала
+        except Exception:
+            pass # Если вышли по общему таймауту
+
+    # План "Б": если гонка не удалась, отдаем Яндекс напрямую без проверки
     return f"{MIRROR_FILES[0]}/{path}"
 
 @app.api_route("/packages/{path:path}", methods=["GET", "HEAD"])
