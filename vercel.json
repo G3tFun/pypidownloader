@@ -1,6 +1,17 @@
 {
-  "rewriteConfig": { "regexp": ".*", "destination": "/api/index.py" },
+  "version": 2,
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api/index.py" }
+    {
+      "source": "/simple/(.*)",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/packages/(.*)",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/",
+      "destination": "/api/index.py"
+    }
   ]
 }
