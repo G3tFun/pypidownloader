@@ -63,6 +63,11 @@ _client: httpx.AsyncClient | None = None
 _index_cache: dict[str, tuple[float, bytes, str]] = {}
 _mirror_cache: dict[str, tuple[float, str]] = {}
 
+# Статистика побед по доменам (живёт, пока жив тёплый serverless-инстанс).
+# domain -> число побед в гонке find_fastest_mirror
+_domain_wins: dict[str, int] = {}
+_last_winner: dict[str, str | None] = {"domain": None, "url": None, "path": None, "time": None}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -209,7 +214,39 @@ async def find_fastest_mirror(path: str) -> str:
 
     result = winner_url or f"https://files.pythonhosted.org/packages/{path}"
     _mirror_cache[path] = (time.time(), result)
+
+    # Фиксируем победителя для статистики /api/top/service
+    domain = urlparse(result).netloc
+    _domain_wins[domain] = _domain_wins.get(domain, 0) + 1
+    _last_winner.update(domain=domain, url=result, path=path, time=time.time())
+
     return result
+
+
+@app.get("/api/top/service")
+async def top_service():
+    """Показывает домен-победитель последней гонки и общий рейтинг зеркал.
+
+    Статистика накапливается только в рамках текущего тёплого
+    serverless-инстанса (in-memory), после холодного старта обнуляется.
+    """
+    if not _domain_wins:
+        return {
+            "top_domain": None,
+            "message": "Гонок ещё не было — статистика появится после первого запроса к /packages/...",
+            "last_winner": None,
+            "ranking": [],
+        }
+
+    ranking = sorted(_domain_wins.items(), key=lambda kv: kv[1], reverse=True)
+    top_domain, top_wins = ranking[0]
+
+    return {
+        "top_domain": top_domain,
+        "top_wins": top_wins,
+        "last_winner": _last_winner,
+        "ranking": [{"domain": d, "wins": w} for d, w in ranking],
+    }
 
 
 @app.api_route("/packages/{path:path}", methods=["GET", "HEAD"])
